@@ -1,0 +1,211 @@
+import os
+from glob import glob
+
+import matplotlib.pyplot as plt
+import seaborn as sns
+from numpy import ma
+from shapely.geometry import box
+import xarray as xr
+import rioxarray as rxr
+import earthpy as et
+import earthpy.spatial as es
+import earthpy.plot as ep
+import earthpy.mask as em
+import pyproj
+import geopandas as gpd
+pyproj.set_use_global_context(True)
+
+# Prettier plotting with seaborn
+sns.set_style('white')
+sns.set(font_scale=1.5)
+
+# Download data and set working directory
+data = et.data.get_data('cold-springs-fire')
+data_2 = et.data.get_data('cs-test-landsat')
+os.chdir(os.path.join(et.io.HOME, 'earth-analytics', 'data'))
+
+
+def open_clean_band(band_path, crop_layer=None):
+    """A function that opens a Landsat band as an (rio)xarray object
+
+    Parameters
+    ----------
+    band_path : list
+        A list of paths to the tif files that you wish to combine.
+
+    crop_layer : geopandas geodataframe
+        A geodataframe containing the clip extent of interest. NOTE: this will 
+        fail if the clip extent is in a different CRS than the raster data.
+
+    Returns
+    -------
+    An single xarray object with the Landsat band data.
+
+    """
+
+    if crop_layer is not None:
+        try:
+            clip_bound = crop_layer.geometry
+            cleaned_band = rxr.open_rasterio(band_path,
+                                             masked=True).rio.clip(clip_bound,
+                                                                   from_disk=True).squeeze()
+        except Exception as err:
+            print("Oops, I need a geodataframe object for this to work.")
+            print(err)
+
+    else:
+        cleaned_band = rxr.open_rasterio(band_path,
+                                     masked=True).squeeze()
+
+    return cleaned_band
+
+
+def process_bands(paths, crop_layer=None, stack=False):
+    """
+    Open, clean and crop a list of raster files using rioxarray.
+
+    Parameters
+    ----------
+    paths : list
+        A list of paths to raster files that could be stacked (of the same 
+        resolution, crs and spatial extent).
+
+    crop_layer : geodataframe
+        A geodataframe containing the crop geometry that you wish to crop your
+        data to.
+
+    stack : boolean
+        If True, return a stacked xarray object. If false will return a list
+        of xarray objects.
+
+    Returns
+    -------
+        Either a list of xarray objects or a stacked xarray object
+    """
+
+    all_bands = []
+    for i, aband in enumerate(paths):
+        cleaned = open_clean_band(aband, crop_layer)
+        cleaned["band"] = i+1
+        all_bands.append(cleaned)
+
+    if stack:
+        print("I'm stacking your data now.")
+        return xr.concat(all_bands, dim="band")
+    else:
+        print("Returning a list of xarray objects.")
+        return all_bands
+
+
+# Open pre fire Landsat data
+landsat_dirpath_pre = os.path.join("cold-springs-fire",
+                                   "landsat_collect",
+                                   "LC080340322016070701T1-SC20180214145604",
+                                   "crop",
+                                   "*band[2-4]*.tif")
+
+landsat_paths_pre = sorted(glob(landsat_dirpath_pre))
+
+landsat_pre = process_bands(landsat_paths_pre, stack=True)
+landsat_pre
+
+# Mask cloudy pixels
+landsat_pre_cl_path = os.path.join("cold-springs-fire",
+                                   "landsat_collect",
+                                   "LC080340322016070701T1-SC20180214145604",
+                                   "crop",
+                                   "LC08_L1TP_034032_20160707_20170221_01_T1_pixel_qa_crop.tif")
+
+landsat_qa = rxr.open_rasterio(landsat_pre_cl_path).squeeze()
+
+high_cloud_confidence = em.pixel_flags["pixel_qa"]["L8"]["High Cloud Confidence"]
+cloud = em.pixel_flags["pixel_qa"]["L8"]["Cloud"]
+cloud_shadow = em.pixel_flags["pixel_qa"]["L8"]["Cloud Shadow"]
+
+all_masked_values = cloud_shadow + cloud + high_cloud_confidence
+
+# Mask the data using the pixel QA layer
+landsat_pre_cl_masked = landsat_pre.where(~landsat_qa.isin(all_masked_values))
+
+
+# Plot
+ep.plot_rgb(landsat_pre_cl_masked,
+            rgb=[2, 1, 0],
+            title="Lots of Missing Values in Your Data \n Landsat CIR Composite Image | 30 meters \n Post Cold Springs Fire - July 8, 2016")
+plt.show()
+
+
+# Create bounds object to clip the cloud free data
+landsat_pre_cloud_ext_bds = landsat_pre.rio.bounds()
+
+df = {'id': [1],
+      'geometry': box(*landsat_pre.rio.bounds())}
+clip_gdf = gpd.GeoDataFrame(df, crs=landsat_pre.rio.crs)
+clip_gdf.plot()
+plt.show()
+
+
+# Read in the "cloud free" landsat data that you downloaded as a part of your homework
+cloud_free_path = os.path.join("cs-test-landsat", 
+                                "*band[2-4]*.tif")
+landsat_paths_pre_cloud_free = sorted(glob(cloud_free_path))
+landsat_pre_cloud_free = process_bands(landsat_paths_pre_cloud_free, 
+                                       stack=True, 
+                                       crop_layer=clip_gdf)
+
+landsat_pre_cloud_free
+
+
+# Are the bounds the same for both datasets?
+landsat_no_clouds_bds = landsat_pre_cloud_free.rio.bounds()
+landsat_pre_cloud_ext_bds = landsat_pre.rio.bounds()
+print("The cloud free data bounds are:", landsat_no_clouds_bds)
+print("The original cloud covered data bounds are:",  landsat_pre_cl_masked.rio.bounds())
+print("Are the bounds the same?", landsat_no_clouds_bds == landsat_pre_cloud_ext_bds)
+
+
+# Create polygons from the bounds
+cloud_free_scene_bds = box(*landsat_no_clouds_bds)
+cloudy_scene_bds = box(*landsat_pre_cloud_ext_bds)
+
+# Do the data overlap spatially?
+cloud_free_scene_bds.intersects(cloudy_scene_bds)
+
+
+# Plot the boundaries
+x, y = cloud_free_scene_bds.exterior.xy
+x1, y1 = cloudy_scene_bds.exterior.xy
+
+fig, ax = plt.subplots(1, 1, figsize=(8, 6))
+
+ax.plot(x, y, color='#6699cc', alpha=0.7,
+        linewidth=3, solid_capstyle='round', zorder=2)
+
+ax.plot(x1, y1, color='purple', alpha=0.7,
+        linewidth=3, solid_capstyle='round', zorder=2)
+
+ax.set_title('Are the spatial extents different?')
+
+plt.show()
+
+
+# Is the CRS the same in each raster?
+landsat_pre.rio.crs == landsat_pre_cloud_free.rio.crs
+
+# Are the shapes the same?
+landsat_pre.shape == landsat_pre_cloud_free.shape
+
+# Get the mask layer from the pre_cloud data
+mask = landsat_pre_cl_masked.isnull()
+
+# Assign every cell in the new array that is masked
+# to the value in the same cell location as the cloud free data
+landsat_pre_clouds_filled = xr.where(mask, landsat_pre_cloud_free, landsat_pre_cl_masked)
+landsat_pre_clouds_filled
+
+# Plot data
+ep.plot_rgb(landsat_pre_clouds_filled.values,
+            rgb=[2, 1, 0],
+            title="Masked Landsat CIR Composite Image | 30 meters \n Post Cold Springs Fire \n July 8, 2016")
+plt.show()
+
